@@ -31,6 +31,7 @@ const diggedCoords = [];
         for (let i = 0; i < MAP_CELL_COUNT; i++) {
             let xi = i % MAP_SIZE;
             let yi = Math.floor(i / MAP_SIZE);
+            let depthlevel = 1;
     
             console.log("exploring [%s, %s]...", xi, yi);
             let amountAvailable = await explore(xi, yi, 1, 1);
@@ -57,7 +58,12 @@ const diggedCoords = [];
                 let digAllowed = licenseToDig.digAllowed;
                 let treasures = [];
                 while (digAllowed-- > 0) {
-                    treasures = [...treasures, ...await dig(licenseToDig.id, xi, yi, 1)];
+                    let diggedTreasures = await dig(licenseToDig.id, xi, yi, depthlevel++);
+                    console.log("digged %s treasures: %s", depthlevel, JSON.stringify(diggedTreasures));
+                    //treasures = [...treasures];
+                    for (let i = 0; i < diggedTreasures.length; i++) {
+                        treasures.push(diggedTreasures[i]);
+                    }
                 }
                 console.log("found %s treasures: %s", treasures.length, treasures);
                     
@@ -86,7 +92,15 @@ const diggedCoords = [];
 
 async function exchangeTreasuresForCoins(treasures) {
     treasures = treasures || [];
-    return await postApi("/cash", treasures);
+    
+    let coins = [];
+    treasures.forEach(async (treasure) => {
+        let coinsForTreasure = await postApi("/cash", treasure);
+        for (let i = 0; i < coinsForTreasure.length; i++) {
+            coins.push(coinsForTreasure[i]);
+        }
+    });
+    return coins;
 }
 
 async function getBalance() {
@@ -162,6 +176,7 @@ async function fetchApi(method, options) {
         responseStatus = res.status;
         if (--retryLeft === 0) break;        
     }
+    /*
     if (res.status !== 200) {
         console.log("fetch api %s method completed with error: %s", method, res.status);
         let error = await res.json();
@@ -169,6 +184,7 @@ async function fetchApi(method, options) {
         console.log(error);
         throw new Error(`Api error (${res.status}): ${JSON.stringify(error)}`);
     }
+    */
     return res;
 }
 
