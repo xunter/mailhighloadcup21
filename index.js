@@ -40,7 +40,7 @@ const diggedCoords = [];
                 console.log("nothing to dig. getting next...");
                 continue;
             }
-
+            
             while (amountAvailable) {            
                 console.log("getting licenses...");
                 let licenses = await getLicenses();
@@ -54,9 +54,13 @@ const diggedCoords = [];
                 }
                 console.log("active license obtained with %s digs allowed.", licenseToDig.digAllowed);
                 console.log("digging for [%s, %s] for %s depth and %s license...", xi, yi, licenseToDig.digAllowed, licenseToDig.id);
-                let treasures = await dig(licenseToDig.id, xi, yi, licenseToDig.digAllowed);
+                let digAllowed = licenseToDig.digAllowed;
+                let treasures = [];
+                while (digAllowed-- > 0) {
+                    treasures = [...treasures, ...await dig(licenseToDig.id, xi, yi, 1)];
+                }
                 console.log("found %s treasures: %s", treasures.length, treasures);
-    
+                    
                 if (treasures.length) {
                     console.log("exchanging treasures to earn money...");
                     let coins = await exchangeTreasuresForCoins(treasures);
