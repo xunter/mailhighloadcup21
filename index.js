@@ -90,7 +90,7 @@ async function getBalance() {
 }
 
 async function issueLicense(coins) {
-    coins = coins || [0];
+    coins = coins || [];
     return await postApi("/licenses", coins);
 }
 
@@ -150,13 +150,20 @@ async function getApi(method) {
 async function fetchApi(method, options) {
     options = options || { method: "GET" };
     let apiUrl = method.indexOf("http") === 0 ? method : (API_BASE_URL + method);
-    let res = await fetch(apiUrl, options);
+    let responseStatus = null;
+    let retryLeft = 1000;
+    let res = null;
+    while ([null, 502, 504].includes(responseStatus)) {
+        res = await fetch(apiUrl, options);
+        responseStatus = res.status;
+        if (--retryLeft === 0) break;        
+    }
     if (res.status !== 200) {
-        console.log("fetched api %s method completed with error: %s", method, res.status);
+        console.log("fetch api %s method completed with error: %s", method, res.status);
         let error = await res.json();
         console.log("api error:");
         console.log(error);
-        throw new Error("Api error (%s): %s", res.status, JSON.stringify(error));
+        throw new Error(`Api error (${res.status}): ${JSON.stringify(error)}`);
     }
     return res;
 }
