@@ -9,5 +9,8 @@ RUN npm config set strict-ssl false
 RUN npm install
  
 COPY . .
- 
+
+ENV MAP_SIZE=3500
+ENV MULTICORE=1
+ENV CORE_COUNT=3
 CMD [ "node", "index.js" ]
