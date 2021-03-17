@@ -3,6 +3,7 @@ const process = require('process');
 const cluster = require('cluster');
 const numCPUs = require('os').cpus().length;
 const util = require('util');
+const { truncate } = require("fs");
 const sleep = ms => new Promise((resolve, reject) => setTimeout(() => { resolve(); }, ms));
 
 const API_ADDRESS = process.env.ADDRESS || "default";
@@ -18,7 +19,7 @@ const MAP_OFFSET_X = Number(process.env.MAP_OFFSET_X || 0);
 const MAP_OFFSET_Y = Number(process.env.MAP_OFFSET_Y || 0);
 const DEPTH = 10; //100
 const MAX_LICENSES_FREE = 3;
-const MAX_LICENSES_PAID = 5;
+const MAX_LICENSES_PAID = 7; //5
 const MAX_LICENSES_ACTIVE = 10;
 
 let _licenses = [];
@@ -31,25 +32,71 @@ let requestsCount = 0;
     try {
         //process.env.MULTICORE = 1;
         if (process.env.MULTICORE && cluster.isMaster) {
+
             let numCPUsForForks = process.env.CORE_COUNT || (numCPUs - 1);
             console.log("master: solution will start as multicore with %s cpus (1 CPU for master)", numCPUsForForks);
             let mapChunkSize = Math.floor(MAP_SIZE / numCPUsForForks);
+            
+            cluster.setupMaster({
+                silent: true
+            });
+
+            let digWorkers = [];
             for (let i = 0; i < numCPUsForForks; i++) {
                 let offsetX = i * mapChunkSize;
                 let offsetY = 0;
-                let spawnWorker = cluster.fork({ 
+                let digWorker = cluster.fork({ 
                     ADDRESS: API_ADDRESS, 
                     Port: API_PORT, 
                     Schema: API_SCHEMA, 
-                    MAP_CELL_COUNT: mapChunkSize, 
+                    MAP_CELL_COUNT: i + 1 === numCPUsForForks ? (mapChunkSize + (MAP_SIZE - mapChunkSize * numCPUsForForks)) : mapChunkSize, 
                     MAP_ROW_COUNT: MAP_SIZE, 
                     MAP_OFFSET_X: offsetX, 
-                    MAP_OFFSET_Y: offsetY 
+                    MAP_OFFSET_Y: offsetY,
+                    DIGGER: 1
                 });
-                spawnWorker.on("message", (msg) => {
-                    console.log("Child worker %s message: %s", spawnWorker.id, JSON.stringify(msg));
+                digWorkers.push(digWorker);
+                digWorker.on("message", async (msg) => {
+                    //console.log("Child worker %s message: %s", digWorker.id, JSON.stringify(msg));
+
+                    if (msg.cmd === "treasures") {
+                        let treasures = msg.treasures;
+                        console.log("worker %s digged %s treasures at [%s, %s]: %s", digWorker.id, treasures.length, msg.x, msg.y, treasures);
+                        console.log("exchanging treasures to earn money...");
+                        let coins = await exchangeTreasuresForCoins(treasures);
+                        console.log("earned %s coins: %s", coins.length, coins);
+                        _coins.push(...coins);
+
+                        console.log("total %s coins. getting actual balance...", _coins.length);
+                        let balance = await getBalance();
+                        console.log("balance is %s with coins (%s): %s", balance.balance, balance.wallet.length, balance.wallet);
+                        //_coins = balance.wallet;
+                    }
                 });
             }
+            
+            let exploreWorker = cluster.fork({ EXPLORER: 1 });
+            exploreWorker.on("message", async (msg) => {
+                if (msg.cmd === "explore") {
+                    let digWorkerIndex = Math.round(Math.random() * (numCPUsForForks - 1));
+                    //console.log("explorer %s found cell with treasures (%s): [%s, %s], sending to %s digger", exploreWorker.id, msg.amount, msg.x, msg.y, digWorkerIndex);
+                    digWorkers[digWorkerIndex].send({ cmd: "treasures", cell: { x: msg.x, y: msg.y, amount: msg.amount } });
+                }
+            });
+            
+            cluster.setupMaster({
+                silent: false
+            });
+
+            let licenseWorker = cluster.fork({ LICENSER: 1 });
+            licenseWorker.on("message", async (msg) => {
+                if (msg.cmd === "license") {
+                    let license = msg.license;
+                    let digWorkerIndex = Math.round(Math.random() * (numCPUsForForks - 1));
+                    console.log("licenser %s got %s license %s with %s dig allowed, sending to %s digger", licenseWorker.id, license.paid ? "paid" : "free", license.id, license.digAllowed, digWorkerIndex);
+                    digWorkers[digWorkerIndex].send({ cmd: "license", license });
+                }
+            });
 
             // If worker process is killed log it
             cluster.on('exit', (worker) => {
@@ -67,15 +114,16 @@ let requestsCount = 0;
                 }
             });
 
+            /*
             if (MAP_SIZE > mapChunkSize * numCPUsForForks) {
                 console.log("available %s cols to process inplace in master", MAP_SIZE - mapChunkSize * numCPUsForForks);
                 await workGoldRush(MAP_SIZE - mapChunkSize * numCPUsForForks, MAP_SIZE, mapChunkSize * numCPUsForForks, 0);
             }
+            */
 
             console.log("keeping master process alive...");
-            setTimeout(() => {
-                console.log("master process timeout");
-            }, 900000);
+            await sleep(900000);
+            console.log("master process timeout");
         } else {
             console.log("%s: run gold rush work for chunk: x=%s, y=%s, cells=%s, rows=%s", 
                 cluster.isMaster ? "single" : "fork", MAP_OFFSET_X, MAP_OFFSET_Y, MAP_CELL_COUNT, MAP_ROW_COUNT);
@@ -83,7 +131,15 @@ let requestsCount = 0;
                 process.send({ cmd: "rungoldrush", chunkx: MAP_OFFSET_X, chunky: MAP_OFFSET_Y, chunksizex: MAP_CELL_COUNT, chunksizey: MAP_ROW_COUNT });
             }
 
-            await workGoldRush(MAP_CELL_COUNT, MAP_ROW_COUNT, MAP_OFFSET_X, MAP_OFFSET_Y);
+            if (process.env.EXPLORER) {
+                await workExplorer(MAP_CELL_COUNT, MAP_ROW_COUNT, MAP_OFFSET_X, MAP_OFFSET_Y);
+            } else if (process.env.DIGGER) {
+                await workDigger(MAP_CELL_COUNT, MAP_ROW_COUNT, MAP_OFFSET_X, MAP_OFFSET_Y);
+            } else if (process.env.LICENSER) {
+                await workLicenses(MAP_CELL_COUNT, MAP_ROW_COUNT, MAP_OFFSET_X, MAP_OFFSET_Y);
+            } else {
+                await workGoldRush(MAP_CELL_COUNT, MAP_ROW_COUNT, MAP_OFFSET_X, MAP_OFFSET_Y);
+            }
             
             if (process.send) {
                 process.send({ cmd: "goldrushcompleted", coinslen: _coins.length, coins: _coins });
@@ -100,7 +156,71 @@ let requestsCount = 0;
     }
 })();
 
-async function workGoldRush(cellCount, rowCount, offsetX, offsetY) {
+async function workLicenses() {
+    while (true) {
+        await sleep(50);
+        let licenses = await getLicenses();
+        if (licenses.code) {
+            console.log("failed to get licenses due to error (%s): %s", licenses.code, licenses.message);
+            continue;
+        }
+        let freeActive = 0;
+        let paidActive = 0;
+        licenses.forEach((l, i) => {
+            console.log("licenses[%s] with %s id, %s dig allowed and %s dig used", i, l.id, l.digAllowed, l.digUsed);
+            if (l.digAllowed === l.digUsed) return;
+            let digCapacity = l.digAllowed;
+            if (digCapacity === 3) {
+                //free license
+                if (l.digAllowed > l.digUsed) {
+                    freeActive++;
+                }
+            }
+            
+            if (digCapacity > 3) {
+                //paid license
+                if (l.digAllowed > l.digUsed) {
+                    paidActive++;
+                }
+            }
+        });
+
+        if (freeActive < MAX_LICENSES_FREE) {
+            for (let i = freeActive; i < MAX_LICENSES_FREE; i++) {
+                let freeLicense = await issueLicense();
+                if (freeLicense.code) {
+                    console.log("failed to issue free license due to error (%s): %s", freeLicense.code, freeLicense.message);
+                    continue;
+                }
+                console.log("issued free license %s with %s digs allowed", freeLicense.id, freeLicense.digAllowed);
+                freeLicense.free = true;
+                if (process.send) {
+                    process.send({ cmd: "license", free: true, license: freeLicense });
+                }
+            }
+        }
+        
+        let balance = await getBalance();
+        //console.log("balance wallet (%s): %s", balance.wallet.length, balance.wallet);
+        if (process.env.USE_PAID_LICENSES && paidActive < MAX_LICENSES_PAID && balance.wallet.length > 0) {
+            for (let i = paidActive; i < MAX_LICENSES_PAID; i++) {
+                let coinsToPayLicense = balance.wallet.splice(0, balance.wallet.length);
+                let paidLicense = await issueLicense(coinsToPayLicense);
+                if (paidLicense.code) {
+                    console.log("failed to issue paid license due to error (%s): %s", paidLicense.code, paidLicense.message);
+                    continue;
+                }
+                console.log("issued paid license %s with %s digs allowed", paidLicense.id, paidLicense.digAllowed);
+                paidLicense.paid = true;
+                if (process.send) {
+                    process.send({ cmd: "license", paid: true, license: paidLicense });
+                }
+            }
+        }
+    }
+}
+
+async function workGoldRush(cellCount, rowCount, offsetX, offsetY, exploreonly = false) {
     
     let mapCellCount = cellCount * rowCount;
     //getLicenses();
@@ -120,6 +240,16 @@ async function workGoldRush(cellCount, rowCount, offsetX, offsetY) {
         }
         let amountAvailable = explored.amount;
         console.log("explored [%s, %s]: %s", xi, yi, amountAvailable);
+
+        if (amountAvailable) {
+            if (process.send) {
+                process.send({ cmd: "explore", x: xi, y: yi, amount: amountAvailable });
+            }
+        }
+
+        if (exploreonly) {
+            continue;
+        }
 
         if (!amountAvailable) {
             console.log("nothing to dig. getting next...");
@@ -192,15 +322,9 @@ async function workGoldRush(cellCount, rowCount, offsetX, offsetY) {
             console.log("found %s treasures: %s", treasures.length, treasures);
                 
             if (treasures.length) {
-                console.log("exchanging treasures to earn money...");
-                let coins = await exchangeTreasuresForCoins(treasures);
-                console.log("earned %s coins: %s", coins.length, coins);
-                _coins.push(...coins);
-
-                console.log("total %s coins. getting actual balance...", _coins.length);
-                let balance = await getBalance();
-                console.log("balance is %s with coins (%s): %s", balance.balance, balance.wallet.length, balance.wallet);
-                //_coins = balance.wallet;
+                if (process.send) {
+                    process.send({ cmd: "treasures", treasures, x: xi, y: yi });
+                }
             }
 
             amountAvailable -= treasures.length;
@@ -213,14 +337,153 @@ async function workGoldRush(cellCount, rowCount, offsetX, offsetY) {
     }
 }
 
+async function workExplorer(cellCount, rowCount, offsetX, offsetY, exploreonly = false) {
+    
+    let mapCellCount = cellCount * rowCount;
+    //getLicenses();
+    for (let i = 0; i < mapCellCount; i++) {
+        let xi = i % cellCount + offsetX;
+        let yi = Math.floor(i / cellCount) + offsetY;
+        let depthlevel = 1;
+
+        console.log("exploring [%s, %s]...", xi, yi);
+        let explored = await explore(xi, yi, 1, 1);
+        if (!explored) {
+            explored = { code: 0, message: "server didn't respond anything" };
+        }
+        if (explored.code) {
+            console.log("exploration for [%s, %s] completed with error (%s): %s. getting next...", xi, yi, explored.code, explored.message);
+            continue;
+        }
+        let amountAvailable = explored.amount;
+        console.log("explored [%s, %s]: %s", xi, yi, amountAvailable);
+
+        if (amountAvailable) {
+            if (process.send) {
+                process.send({ cmd: "explore", x: xi, y: yi, amount: amountAvailable });
+            }
+        }
+    }
+}
+
+
+async function workDigger(cellCount, rowCount, offsetX, offsetY) {
+    const cellsWithTreasures = [];
+    const licenses = [];
+
+    process.on("message", msg => {
+        if (msg.cmd === "treasures") {
+            cellsWithTreasures.push(msg.cell);
+        }
+        if (msg.cmd === "license") {
+            let license = msg.license;
+            if (license.free) {
+                licenses.unshift(license)
+            } else {
+                licenses.push(license);
+            }
+        }
+    });
+
+ while (true) {
+  let nextCell = cellsWithTreasures.shift();
+  if (!nextCell) {
+      console.log("no cells with treasures. awaiting...");
+   await sleep(50);
+   continue;
+  }
+  let xi = nextCell.x;
+  let yi = nextCell.y;
+  let amountAvailable = nextCell.amount;
+  
+  let depthlevel = 1;
+  
+  while (amountAvailable) {   
+      let licenseToDig = null;
+      while (!(licenseToDig = licenses.pop())) {
+
+        console.log("no license to dig. awaiting...");
+        await sleep(50);
+      }
+      console.log("active license obtained with %s digs allowed and %s digs used.", licenseToDig.digAllowed, licenseToDig.digUsed);
+      console.log("digging for [%s, %s] for %s depth and %s license id...", xi, yi, depthlevel, licenseToDig.id);
+      let treasures = [];
+      let shouldNextCell = false;
+      while (licenseToDig.digAllowed - licenseToDig.digUsed > 0) {
+          let diggedTreasures = await dig(licenseToDig.id, xi, yi, depthlevel++);
+          licenseToDig.digUsed++;
+          if (diggedTreasures.code) {
+              if (diggedTreasures.code === 404) {
+                  continue;
+              } else if (diggedTreasures.code === 403 && diggedTreasures.message === "no such license") {
+                  console.log("broken license %s to dig at [%s, %s], getting another...", licenseToDig.id, xi, yi);
+                  break;
+              } else {
+                  console.log("dig completed with error (%s): %s", diggedTreasures.code, diggedTreasures.message);
+                  licenseToDig.digUsed--;
+                  if (depthlevel > 10 && [608, 1000].includes(diggedTreasures.code)) {
+                      shouldNextCell = true;
+                      break;
+                  }
+              }
+          }
+          if (diggedTreasures.length) {
+              console.log("digged %s treasures at %s depth: %s", diggedTreasures.length, depthlevel, JSON.stringify(diggedTreasures));
+              //treasures = [...treasures];
+              
+              for (let i = 0; i < diggedTreasures.length; i++) {
+                  treasures.push(diggedTreasures[i]);
+              }
+          }
+      }
+      console.log("found %s treasures: %s", treasures.length, treasures);
+          
+      if (treasures.length) {
+          if (process.send) {
+              process.send({ cmd: "treasures", treasures, x: xi, y: yi });
+          }
+      }
+
+      amountAvailable -= treasures.length;
+      if (amountAvailable) {
+          console.log("left %s treasures at [%s, %s] pos", amountAvailable, xi, yi);
+      } else {
+          console.log("pos [%s, %s] contains no more treasures", xi, yi);
+      }
+
+      
+    if (licenseToDig.digAllowed - licenseToDig.digUsed > 0) {
+        if (licenseToDig.free) {
+            licenses.unshift(licenseToDig);
+        } else {
+            licenses.push(licenseToDig);
+        }
+    }
+    if (shouldNextCell) {
+        if (amountAvailable) {
+            console.log("Failed to dig treasures at [%s, %s] cell. Breaking...", xi, yi);
+        }
+        break;
+    }
+  }
+
+ }
+
+}
+
 async function exchangeTreasuresForCoins(treasures) {
     treasures = treasures || [];
     
     let coins = [];
     treasures.forEach(async (treasure) => {
         let coinsForTreasure = await postApi("/cash", treasure);
-        for (let i = 0; i < coinsForTreasure.length; i++) {
-            coins.push(coinsForTreasure[i]);
+        
+        if (coinsForTreasure.code) {
+            console.log("failed to exchange treasure %s for coins due to error (%s): %s", treasure, coinsForTreasure.code, coinsForTreasure.message);
+        } else {
+            for (let i = 0; i < coinsForTreasure.length; i++) {
+                coins.push(coinsForTreasure[i]);
+            }
         }
     });
     return coins;
@@ -296,7 +559,7 @@ async function fetchApi(method, options) {
     lastRequestTime = requestTime;
     while ([null, 500, 502, 504].includes(responseStatus) || (responseStatus > 500 && responseStatus < 600)) {
         if (responseStatus !== null) {
-            console.log("Server failed to process %s request and ended with %s error", method, responseStatus);
+            console.log("Server failed to process %s %s request and ended with %s error", options.method, method, responseStatus);
             
             try {
                 let resHealthCheck = await fetch(API_BASE_URL + "/health-check");
@@ -311,7 +574,7 @@ async function fetchApi(method, options) {
         try {
             res = await fetch(apiUrl, options);
         } catch (err) {
-            console.log("Server failed to respond to %s request due to error: %s. Trying one more time...", method, err);
+            console.log("Server failed to respond to %s %s request due to error: %s. Trying one more time...", options.method, method, err);
             await sleep(100);
             responseStatus = 500;
         }
