@@ -83,10 +83,6 @@ let requestsCount = 0;
                     digWorkers[digWorkerIndex].send({ cmd: "treasures", cell: { x: msg.x, y: msg.y, amount: msg.amount } });
                 }
             });
-            
-            cluster.setupMaster({
-                silent: false
-            });
 
             let licenseWorker = cluster.fork({ LICENSER: 1 });
             licenseWorker.on("message", async (msg) => {
@@ -201,10 +197,13 @@ async function workLicenses() {
         }
         
         let balance = await getBalance();
+        let coinsFromWallet = [...balance.wallet];
+        coinsFromWallet.reverse();
         //console.log("balance wallet (%s): %s", balance.wallet.length, balance.wallet);
         if (process.env.USE_PAID_LICENSES && paidActive < MAX_LICENSES_PAID && balance.wallet.length > 0) {
             for (let i = paidActive; i < MAX_LICENSES_PAID; i++) {
-                let coinsToPayLicense = balance.wallet.splice(0, balance.wallet.length);
+                let coinsToPayLicense = coinsFromWallet.splice(0, Math.round(balance.wallet.length * (Number(process.env.COINS_PERCENTAGE_FOR_PAID_LICENSE) || 0.1)));
+                console.log("pay %s coins to issue a paid license: %s", coinsToPayLicense.length, coinsToPayLicense);
                 let paidLicense = await issueLicense(coinsToPayLicense);
                 if (paidLicense.code) {
                     console.log("failed to issue paid license due to error (%s): %s", paidLicense.code, paidLicense.message);
@@ -408,32 +407,29 @@ async function workDigger(cellCount, rowCount, offsetX, offsetY) {
       console.log("active license obtained with %s digs allowed and %s digs used.", licenseToDig.digAllowed, licenseToDig.digUsed);
       console.log("digging for [%s, %s] for %s depth and %s license id...", xi, yi, depthlevel, licenseToDig.id);
       let treasures = [];
-      let shouldNextCell = false;
-      while (licenseToDig.digAllowed - licenseToDig.digUsed > 0) {
-          let diggedTreasures = await dig(licenseToDig.id, xi, yi, depthlevel++);
-          licenseToDig.digUsed++;
-          if (diggedTreasures.code) {
-              if (diggedTreasures.code === 404) {
-                  continue;
-              } else if (diggedTreasures.code === 403 && diggedTreasures.message === "no such license") {
-                  console.log("broken license %s to dig at [%s, %s], getting another...", licenseToDig.id, xi, yi);
-                  break;
-              } else {
-                  console.log("dig completed with error (%s): %s", diggedTreasures.code, diggedTreasures.message);
-                  licenseToDig.digUsed--;
-                  if (depthlevel > 10 && [608, 1000].includes(diggedTreasures.code)) {
-                      shouldNextCell = true;
-                      break;
-                  }
+      
+      let diggedTreasures = await dig(licenseToDig.id, xi, yi, depthlevel++);
+      licenseToDig.digUsed++;
+      if (diggedTreasures.code) {
+          if (diggedTreasures.code === 404) {
+              // continue
+          } else if (diggedTreasures.code === 403 && diggedTreasures.message === "no such license") {
+              console.log("broken license %s to dig at [%s, %s], getting another...", licenseToDig.id, xi, yi);
+              licenseToDig.digUsed = licenseToDig.digAllowed;
+          } else {
+              console.log("dig completed with error (%s): %s", diggedTreasures.code, diggedTreasures.message);
+              licenseToDig.digUsed--;
+              if (depthlevel > 10 && [608, 1000].includes(diggedTreasures.code)) {
+                  amountAvailable = 0;
               }
           }
-          if (diggedTreasures.length) {
-              console.log("digged %s treasures at %s depth: %s", diggedTreasures.length, depthlevel, JSON.stringify(diggedTreasures));
-              //treasures = [...treasures];
-              
-              for (let i = 0; i < diggedTreasures.length; i++) {
-                  treasures.push(diggedTreasures[i]);
-              }
+      }
+      if (diggedTreasures.length) {
+          console.log("digged %s treasures at %s depth: %s", diggedTreasures.length, depthlevel, JSON.stringify(diggedTreasures));
+          //treasures = [...treasures];
+          
+          for (let i = 0; i < diggedTreasures.length; i++) {
+              treasures.push(diggedTreasures[i]);
           }
       }
       console.log("found %s treasures: %s", treasures.length, treasures);
@@ -458,12 +454,6 @@ async function workDigger(cellCount, rowCount, offsetX, offsetY) {
         } else {
             licenses.push(licenseToDig);
         }
-    }
-    if (shouldNextCell) {
-        if (amountAvailable) {
-            console.log("Failed to dig treasures at [%s, %s] cell. Breaking...", xi, yi);
-        }
-        break;
     }
   }
 
