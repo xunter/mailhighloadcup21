@@ -17,7 +17,7 @@ const MAP_CELL_COUNT = Number(process.env.MAP_CELL_COUNT || 3500);
 const MAP_ROW_COUNT = Number(process.env.MAP_ROW_COUNT || 3500);
 const MAP_OFFSET_X = Number(process.env.MAP_OFFSET_X || 0);
 const MAP_OFFSET_Y = Number(process.env.MAP_OFFSET_Y || 0);
-const DEPTH = 10; //100
+const MAX_DEPTH = Number(process.env.MAX_DEPTH_LEVEL || 10); //100
 const MAX_LICENSES_FREE = 3;
 const MAX_LICENSES_PAID = 7; //5
 const MAX_LICENSES_ACTIVE = 10;
@@ -397,6 +397,10 @@ async function workDigger(cellCount, rowCount, offsetX, offsetY) {
   
   let depthlevel = 1;
   
+  if (depthlevel > MAX_DEPTH && process.env.EXPLICIT_RESTRICT_MAX_DEPTH_LEVEL) {
+      amountAvailable = 0;
+  }
+
   while (amountAvailable) {   
       let licenseToDig = null;
       while (!(licenseToDig = licenses.pop())) {
@@ -428,8 +432,10 @@ async function workDigger(cellCount, rowCount, offsetX, offsetY) {
           console.log("digged %s treasures at %s depth: %s", diggedTreasures.length, depthlevel, JSON.stringify(diggedTreasures));
           //treasures = [...treasures];
           
-          for (let i = 0; i < diggedTreasures.length; i++) {
-              treasures.push(diggedTreasures[i]);
+          if (depthlevel >= (Number(process.env.MIN_DEPTH_TO_SELL_TREASURES) || 5)) {
+            for (let i = 0; i < diggedTreasures.length; i++) {
+                treasures.push(diggedTreasures[i]);
+            }
           }
       }
       console.log("found %s treasures: %s", treasures.length, treasures);
